@@ -1,0 +1,60 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: recon
+      POSTGRES_PASSWORD: recon
+      POSTGRES_DB: postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./infra/postgres-init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "psql -h 127.0.0.1 -U recon -d recon_db -c 'SELECT 1' >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  trade-service:
+    build: ./trade-service
+    restart: on-failure
+    environment:
+      DATABASE_URL: postgresql://recon:recon@postgres:5432/trades_db
+    ports:
+      - "8001:8001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  recon-service:
+    build: ./recon-service
+    restart: on-failure
+    environment:
+      DATABASE_URL: postgresql://recon:recon@postgres:5432/recon_db
+      TRADE_SERVICE_URL: http://trade-service:8001
+      PRICE_TOLERANCE_BPS: "1"
+    ports:
+      - "8002:8002"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      trade-service:
+        condition: service_healthy
+
+  frontend:
+    build: ./frontend
+    restart: on-failure
+    environment:
+      TRADE_SERVICE_URL: http://trade-service:8001
+      RECON_SERVICE_URL: http://recon-service:8002
+    ports:
+      - "3000:80"
+    depends_on:
+      trade-service:
+        condition: service_healthy
+      recon-service:
+        condition: service_healthy
+
+volumes:
+  pgdata:

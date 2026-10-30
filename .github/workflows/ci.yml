@@ -1,0 +1,121 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  backend-tests:
+    name: Test ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [trade-service, recon-service]
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: recon
+          POSTGRES_PASSWORD: recon
+          POSTGRES_DB: ci_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U recon -d ci_db"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    defaults:
+      run:
+        working-directory: ${{ matrix.service }}
+    env:
+      DATABASE_URL: postgresql://recon:recon@localhost:5432/ci_db
+      TEST_DATABASE_URL: postgresql+psycopg://recon:recon@localhost:5432/ci_db
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: ${{ matrix.service }}/requirements*.txt
+      - run: pip install -r requirements-dev.txt
+      - name: Apply and roll back migrations
+        run: |
+          alembic upgrade head
+          alembic downgrade base
+      - name: Run tests
+        run: pytest -v
+
+  frontend-tests:
+    name: Test frontend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+
+  e2e:
+    name: End-to-end smoke test
+    runs-on: ubuntu-latest
+    needs: [backend-tests, frontend-tests]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start the full stack
+        run: docker compose up -d --build --wait --wait-timeout 180
+      - name: Load sample trades through the frontend proxy
+        run: |
+          curl -fsS -X POST http://localhost:3000/api/trades/sample | tee sample.json
+          grep -q '"inserted":80' sample.json
+      - name: Reconcile a trade date and check the result
+        run: |
+          curl -fsS -X POST http://localhost:3000/api/recon/runs \
+            -H "Content-Type: application/json" \
+            -d '{"trade_date":"2026-10-14"}' | tee run.json
+          grep -q '"break_count":10' run.json
+          grep -q '"matched_count":31' run.json
+      - name: Frontend is served
+        run: curl -fsS http://localhost:3000/ | grep -q "TradeRecon"
+      - name: Logs on failure
+        if: failure()
+        run: docker compose logs
+      - name: Stop the stack
+        if: always()
+        run: docker compose down -v
+
+  publish:
+    name: Publish images to GHCR
+    runs-on: ubuntu-latest
+    needs: [e2e]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push images
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          for SERVICE in trade-service recon-service frontend; do
+            IMAGE=ghcr.io/$OWNER/traderecon-$SERVICE
+            docker build -t $IMAGE:latest -t $IMAGE:${{ github.sha }} ./$SERVICE
+            docker push $IMAGE:latest
+            docker push $IMAGE:${{ github.sha }}
+          done

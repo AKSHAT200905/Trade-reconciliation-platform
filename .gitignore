@@ -1,0 +1,12 @@
+*.db
+*.py[cod]
+.DS_Store
+.env
+.idea/
+.pytest_cache/
+.venv/
+.vscode/
+__pycache__/
+frontend/dist/
+node_modules/
+venv/
